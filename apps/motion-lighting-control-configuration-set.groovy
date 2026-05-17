@@ -222,7 +222,8 @@ private void ensureTargetState(String reason) {
 
 private void ensureLightsOn(String reason) {
     Integer level = currentDimmerLevel()
-    logDebug "Ensuring lights are on for ${reason}; dimmer level=${level}"
+    Boolean daylight = isDaylightNow()
+    logDebug "Ensuring lights are on for ${reason}; daylight=${daylight}; dimmer level=${level}"
 
     selectedDimmers().each { device ->
         Integer currentLevel = safeInteger(device.currentValue("level"), null)
@@ -237,6 +238,17 @@ private void ensureLightsOn(String reason) {
             logDebug "Turning on ${device}"
             device.on()
         }
+    }
+
+    if (daylight) {
+        atomicState.multiToggleCycleActive = false
+        selectedMultiToggleSwitches().each { device ->
+            if (device.currentValue("switch") != "on") {
+                logDebug "Turning on ${device} without multi-toggle during daylight"
+                device.on()
+            }
+        }
+        return
     }
 
     List switchesToToggle = selectedMultiToggleSwitches().findAll { device ->

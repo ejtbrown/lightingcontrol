@@ -17,7 +17,8 @@ presence sources.
   on.
 - Single-toggle switches are turned on and off directly, with no dwell delay or
   special sequence.
-- Multi-toggle switches use their starting state when the app turns them on. If
+- Multi-toggle switches turn on directly during daylight hours. Outside the
+  daylight window, they use their starting state when the app turns them on. If
   the switch is already on, it is turned off, paused for the configured dwell
   time, and turned back on. If it is off, it is turned on, paused, turned off,
   paused again, and turned on.
