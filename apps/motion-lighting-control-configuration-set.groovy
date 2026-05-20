@@ -81,6 +81,12 @@ preferences {
                     title: "Multi-toggle dwell time, milliseconds",
                     defaultValue: 500,
                     required: true
+
+                input name: "modeSwitchDwellSeconds",
+                    type: "number",
+                    title: "Mode switch dwell time, seconds",
+                    defaultValue: 4,
+                    required: true
             }
         }
 
@@ -133,7 +139,7 @@ def updated() {
     log.info "Updated ${configurationTitle()}"
     unsubscribe()
     unschedule()
-    state.clear()
+    state.offDeadlineMs = null
     initialize()
 }
 
@@ -146,6 +152,8 @@ def initialize() {
         log.warn "App is not fully configured. Select a motion or presence sensor and at least one controlled light."
         return
     }
+
+    ensureMultiToggleTrackerStateVersion()
 
     if (motionDevice) {
         subscribe(motionDevice, "motion", "presenceSourceHandler")
@@ -182,6 +190,7 @@ def presenceSourceHandler(evt) {
 
 def controlledSwitchHandler(evt) {
     logDebug "Controlled switch event: ${evt.device} ${evt.value}"
+    recordControlledSwitchEvent(evt)
 
     Long ignoreUntil = safeLong(atomicState.ignoreSwitchEventsUntilMs, null)
     if (atomicState.multiToggleInProgress || (ignoreUntil && now() < ignoreUntil)) {
@@ -240,24 +249,9 @@ private void ensureLightsOn(String reason) {
         }
     }
 
-    if (daylight) {
-        atomicState.multiToggleCycleActive = false
-        selectedMultiToggleSwitches().each { device ->
-            if (device.currentValue("switch") != "on") {
-                logDebug "Turning on ${device} without multi-toggle during daylight"
-                device.on()
-            }
-        }
-        return
-    }
-
-    List switchesToToggle = selectedMultiToggleSwitches().findAll { device ->
-        !atomicState.multiToggleCycleActive || device.currentValue("switch") != "on"
-    }
-
-    if (switchesToToggle) {
-        runMultiToggleSequence(switchesToToggle)
-        atomicState.multiToggleCycleActive = true
+    String desiredMode = daylight ? "day" : "night"
+    selectedMultiToggleSwitches().each { device ->
+        ensureMultiToggleSwitchOn(device, desiredMode)
     }
 }
 
@@ -268,35 +262,413 @@ private void ensureLightsOff(String reason) {
     controlledDevices().each { device ->
         if (device.currentValue("switch") != "off") {
             logDebug "Turning off ${device}"
+            if (isSelectedMultiToggleSwitch(device)) {
+                recordMultiToggleOff(device, now())
+            }
             device.off()
         }
     }
 }
 
-private void runMultiToggleSequence(List devices) {
-    Integer dwellMs = multiToggleDwellMilliseconds()
-    List devicesCurrentlyOn = devices.findAll { device -> device.currentValue("switch") == "on" }
-    List devicesCurrentlyOff = devices.findAll { device -> device.currentValue("switch") != "on" }
+private void ensureMultiToggleSwitchOn(device, String desiredMode) {
+    ensureMultiToggleTrackerStateVersion()
 
-    atomicState.multiToggleInProgress = true
-    atomicState.ignoreSwitchEventsUntilMs = now() + (dwellMs * 2L) + 5000L
+    String currentMode = knownMultiToggleMode(device)
+    Boolean isOn = device.currentValue("switch") == "on"
+
+    if (isOn) {
+        if (!currentMode) {
+            logDebug "Assuming ${device} is already in ${desiredMode} mode because it is on"
+            setKnownMultiToggleMode(device, desiredMode, "assumed")
+            return
+        }
+
+        if (currentMode == desiredMode) {
+            logDebug "${device} is already on in ${desiredMode} mode"
+            return
+        }
+
+        logDebug "Switching ${device} from ${currentMode} to ${desiredMode} mode while on"
+        runMultiToggleFromOn(device, desiredMode)
+        return
+    }
+
+    if (!currentMode) {
+        logDebug "No known mode for ${device}; establishing ${desiredMode} mode"
+        if (desiredMode == "night") {
+            runMultiToggleFromOff(device, desiredMode, currentMode)
+        } else {
+            turnMultiToggleOnPreservingMode(device, desiredMode)
+        }
+        return
+    }
+
+    if (currentMode == desiredMode) {
+        turnMultiToggleOnPreservingMode(device, desiredMode)
+        return
+    }
+
+    if (isWithinModeSwitchDwell(device)) {
+        logDebug "Turning on ${device} within mode switch dwell to change ${currentMode} mode to ${desiredMode} mode"
+        turnMultiToggleOnExpectingMode(device, desiredMode)
+        return
+    }
+
+    logDebug "Running multi-toggle sequence for ${device} to change ${currentMode} mode to ${desiredMode} mode"
+    runMultiToggleFromOff(device, desiredMode, currentMode)
+}
+
+private void turnMultiToggleOnPreservingMode(device, String desiredMode) {
+    Integer waitMs = remainingModeSwitchDwellMs(device)
+    if (waitMs > 0) {
+        Long eventSerial = multiToggleEventSerial(device)
+        logDebug "Waiting ${waitMs}ms before turning on ${device} to preserve ${desiredMode} mode"
+        pauseExecution(waitMs)
+
+        if (multiToggleEventSerial(device) != eventSerial) {
+            logDebug "${device} changed while waiting to preserve ${desiredMode} mode; re-evaluating"
+            ensureMultiToggleSwitchOn(device, desiredMode)
+            return
+        }
+    }
+
+    if (device.currentValue("switch") == "on") {
+        String currentMode = knownMultiToggleMode(device)
+        if (currentMode == desiredMode) {
+            logDebug "${device} turned on in ${desiredMode} mode while waiting; no on command needed"
+            return
+        }
+
+        logDebug "${device} turned on in ${currentMode ?: 'unknown'} mode while waiting; switching to ${desiredMode} mode"
+        runMultiToggleFromOn(device, desiredMode)
+        return
+    }
+
+    logDebug "Turning on ${device} in ${desiredMode} mode"
+    turnMultiToggleOnPreservingKnownMode(device, desiredMode)
+}
+
+private void turnMultiToggleOnPreservingKnownMode(device, String desiredMode) {
+    device.on()
+    setKnownMultiToggleMode(device, desiredMode, "app-preserved")
+}
+
+private void turnMultiToggleOnExpectingMode(device, String expectedMode) {
+    setExpectedMultiToggleMode(device, expectedMode)
+    device.on()
+    setKnownMultiToggleMode(device, expectedMode)
+}
+
+private void runMultiToggleFromOn(device, String desiredMode) {
+    Integer dwellMs = multiToggleDwellMilliseconds()
+
+    beginMultiToggleCommandWindow(dwellMs + 5000)
+    try {
+        logDebug "Starting on-state multi-toggle sequence for ${device}; dwell=${dwellMs}ms; desiredMode=${desiredMode}"
+        recordMultiToggleOff(device, now())
+        device.off()
+        pauseExecution(dwellMs)
+        turnMultiToggleOnExpectingMode(device, desiredMode)
+    } finally {
+        endMultiToggleCommandWindow()
+    }
+}
+
+private void runMultiToggleFromOff(device, String desiredMode, String currentMode) {
+    Integer dwellMs = multiToggleDwellMilliseconds()
+    Integer waitMs = remainingModeSwitchDwellMs(device)
+    if (waitMs > 0) {
+        Long eventSerial = multiToggleEventSerial(device)
+        logDebug "Waiting ${waitMs}ms before starting multi-toggle sequence for ${device}"
+        pauseExecution(waitMs)
+
+        if (multiToggleEventSerial(device) != eventSerial) {
+            logDebug "${device} changed while waiting to start a multi-toggle sequence; re-evaluating ${desiredMode} mode"
+            ensureMultiToggleSwitchOn(device, desiredMode)
+            return
+        }
+    }
+
+    if (device.currentValue("switch") == "on") {
+        logDebug "${device} turned on while waiting to start a multi-toggle sequence"
+        ensureMultiToggleSwitchOn(device, desiredMode)
+        return
+    }
+
+    beginMultiToggleCommandWindow((dwellMs * 2) + 5000)
 
     try {
-        logDebug "Starting multi-toggle sequence for ${devices*.displayName}; dwell=${dwellMs}ms; on=${devicesCurrentlyOn*.displayName}; off=${devicesCurrentlyOff*.displayName}"
-
-        devicesCurrentlyOn.each { it.off() }
-        devicesCurrentlyOff.each { it.on() }
+        logDebug "Starting off-state multi-toggle sequence for ${device}; dwell=${dwellMs}ms; currentMode=${currentMode ?: 'unknown'}; desiredMode=${desiredMode}"
+        if (currentMode) {
+            setExpectedMultiToggleMode(device, currentMode)
+        }
+        device.on()
         pauseExecution(dwellMs)
 
-        devicesCurrentlyOn.each { it.on() }
-        if (devicesCurrentlyOff) {
-            devicesCurrentlyOff.each { it.off() }
-            pauseExecution(dwellMs)
-            devicesCurrentlyOff.each { it.on() }
-        }
+        recordMultiToggleOff(device, now())
+        device.off()
+        pauseExecution(dwellMs)
+
+        turnMultiToggleOnExpectingMode(device, desiredMode)
     } finally {
-        atomicState.multiToggleInProgress = false
-        atomicState.ignoreSwitchEventsUntilMs = now() + 5000L
+        endMultiToggleCommandWindow()
+    }
+}
+
+private void beginMultiToggleCommandWindow(Integer durationMs) {
+    atomicState.multiToggleInProgress = true
+    atomicState.ignoreSwitchEventsUntilMs = now() + Math.max(0, durationMs as Integer)
+}
+
+private void endMultiToggleCommandWindow() {
+    atomicState.multiToggleInProgress = false
+    atomicState.ignoreSwitchEventsUntilMs = now() + 5000L
+}
+
+private void recordControlledSwitchEvent(evt) {
+    if (!evt?.device || !isSelectedMultiToggleSwitch(evt.device)) {
+        return
+    }
+
+    bumpMultiToggleEventSerial(evt.device)
+
+    if (evt.value == "off") {
+        recordMultiToggleOff(evt.device, eventTimeMs(evt))
+        return
+    }
+
+    if (evt.value != "on") {
+        return
+    }
+
+    String expectedMode = expectedMultiToggleMode(evt.device)
+    if (expectedMode) {
+        setKnownMultiToggleMode(evt.device, expectedMode)
+        clearExpectedMultiToggleMode(evt.device)
+        logDebug "Recorded ${evt.device} as ${expectedMode} mode from app command"
+        return
+    }
+
+    String currentMode = knownMultiToggleMode(evt.device)
+    if (currentMode && isWithinModeSwitchDwell(evt.device)) {
+        String newMode = oppositeMultiToggleMode(currentMode)
+        setKnownMultiToggleMode(evt.device, newMode, "event")
+        logDebug "Recorded ${evt.device} as ${newMode} mode from on event inside mode switch dwell"
+    }
+}
+
+private Boolean isSelectedMultiToggleSwitch(device) {
+    String deviceId = device.id as String
+    return selectedMultiToggleSwitches().any { selected -> (selected.id as String) == deviceId }
+}
+
+private String knownMultiToggleMode(device) {
+    ensureMultiToggleTrackerStateVersion()
+
+    String storedMode = atomicState[multiToggleModeKey(device)] as String
+    String storedSource = multiToggleModeSource(device)
+
+    if (storedMode && storedSource && !modeSourceShouldInferFromHistory(storedSource)) {
+        return storedMode
+    }
+
+    String inferredMode = inferMultiToggleModeFromHistory(device)
+
+    if (inferredMode && (!storedMode || !storedSource || modeSourceShouldInferFromHistory(storedSource))) {
+        logDebug "Inferred ${device} as ${inferredMode} mode from switch history"
+        setKnownMultiToggleMode(device, inferredMode, "history")
+        return inferredMode
+    }
+
+    return storedMode
+}
+
+private Boolean modeSourceShouldInferFromHistory(String source) {
+    return !source || source == "assumed" || source == "app-preserved"
+}
+
+private void ensureMultiToggleTrackerStateVersion() {
+    Integer version = safeInteger(atomicState.multiToggleTrackerStateVersion, 0)
+    if (version >= 2) {
+        return
+    }
+
+    selectedMultiToggleSwitches().each { device ->
+        if (atomicState[multiToggleModeKey(device)]) {
+            atomicState[multiToggleModeSourceKey(device)] = "assumed"
+        }
+        clearExpectedMultiToggleMode(device)
+    }
+
+    atomicState.multiToggleTrackerStateVersion = 2
+    logDebug "Reset multi-toggle mode confidence after tracker update"
+}
+
+private void setKnownMultiToggleMode(device, String mode) {
+    setKnownMultiToggleMode(device, mode, "app")
+}
+
+private void setKnownMultiToggleMode(device, String mode, String source) {
+    if (mode) {
+        atomicState[multiToggleModeKey(device)] = mode
+        atomicState[multiToggleModeSourceKey(device)] = source ?: "app"
+    }
+}
+
+private String multiToggleModeSource(device) {
+    return atomicState[multiToggleModeSourceKey(device)] as String
+}
+
+private String expectedMultiToggleMode(device) {
+    return atomicState[multiToggleExpectedModeKey(device)] as String
+}
+
+private void setExpectedMultiToggleMode(device, String mode) {
+    if (mode) {
+        atomicState[multiToggleExpectedModeKey(device)] = mode
+    }
+}
+
+private void clearExpectedMultiToggleMode(device) {
+    atomicState[multiToggleExpectedModeKey(device)] = null
+}
+
+private String oppositeMultiToggleMode(String mode) {
+    return mode == "night" ? "day" : "night"
+}
+
+private String multiToggleModeKey(device) {
+    return "multiToggleMode_${device.id}"
+}
+
+private String multiToggleModeSourceKey(device) {
+    return "multiToggleModeSource_${device.id}"
+}
+
+private String multiToggleExpectedModeKey(device) {
+    return "multiToggleExpectedMode_${device.id}"
+}
+
+private String multiToggleEventSerialKey(device) {
+    return "multiToggleEventSerial_${device.id}"
+}
+
+private String multiToggleLastOffKey(device) {
+    return "multiToggleLastOffMs_${device.id}"
+}
+
+private Long multiToggleEventSerial(device) {
+    return safeLong(atomicState[multiToggleEventSerialKey(device)], 0L)
+}
+
+private void bumpMultiToggleEventSerial(device) {
+    atomicState[multiToggleEventSerialKey(device)] = multiToggleEventSerial(device) + 1L
+}
+
+private void recordMultiToggleOff(device, Long eventMs) {
+    atomicState[multiToggleLastOffKey(device)] = eventMs ?: now()
+}
+
+private Long lastMultiToggleOffMs(device) {
+    Long storedMs = safeLong(atomicState[multiToggleLastOffKey(device)], null)
+    Long historyMs = latestSwitchOffMsFromHistory(device)
+    List values = [storedMs, historyMs].findAll { value -> value != null }
+    return values ? values.max() as Long : null
+}
+
+private Boolean isWithinModeSwitchDwell(device) {
+    return remainingModeSwitchDwellMs(device) > 0
+}
+
+private Integer remainingModeSwitchDwellMs(device) {
+    Long lastOffMs = lastMultiToggleOffMs(device)
+    if (!lastOffMs) {
+        return 0
+    }
+
+    Long elapsedMs = now() - lastOffMs
+    Long dwellMs = modeSwitchDwellMilliseconds() as Long
+    return elapsedMs < dwellMs ? Math.max(1, (dwellMs - elapsedMs) as Integer) : 0
+}
+
+private Long latestSwitchOffMsFromHistory(device) {
+    try {
+        Long lookbackMs = ((modeSwitchDwellSecondsValue() + 5) * 1000L) as Long
+        List offEventTimes = switchEventsFromHistory(device, lookbackMs, 20).findAll { event ->
+            event.value == "off"
+        }.collect { event ->
+            event.date.time as Long
+        }
+
+        return offEventTimes ? offEventTimes.max() as Long : null
+    } catch (Exception e) {
+        logDebug "Unable to read switch history for ${device}: ${e.message}"
+        return null
+    }
+}
+
+private String inferMultiToggleModeFromHistory(device) {
+    try {
+        List events = switchEventsFromHistory(device, 24L * 60L * 60L * 1000L, 80).sort { event ->
+            event.date.time
+        }
+        String mode = null
+
+        events.eachWithIndex { event, Integer index ->
+            if (event.value != "on") {
+                return
+            }
+
+            if (isFinalOnInMultiTogglePattern(events, index)) {
+                mode = desiredMultiToggleModeAt(event.date)
+                return
+            }
+
+            def previousEvent = index > 0 ? events[index - 1] : null
+            if (mode && previousEvent?.value == "off" && isInsideModeSwitchDwell(previousEvent.date.time, event.date.time)) {
+                mode = oppositeMultiToggleMode(mode)
+            }
+        }
+
+        return mode
+    } catch (Exception e) {
+        logDebug "Unable to infer multi-toggle mode for ${device}: ${e.message}"
+        return null
+    }
+}
+
+private List switchEventsFromHistory(device, Long lookbackMs, Integer maxEvents) {
+    Date since = new Date(now() - lookbackMs)
+    def events = device.eventsSince(since, [max: maxEvents])
+    return (events ?: []).findAll { event ->
+        event.name == "switch" && (event.value == "on" || event.value == "off") && event.date
+    }
+}
+
+private Boolean isFinalOnInMultiTogglePattern(List events, Integer index) {
+    if (index < 2 || events[index].value != "on") {
+        return false
+    }
+
+    def previousOff = events[index - 1]
+    def previousOn = events[index - 2]
+    Long dwellToleranceMs = (multiToggleDwellMilliseconds() + 2000L) as Long
+
+    return previousOff.value == "off" &&
+        previousOn.value == "on" &&
+        (events[index].date.time - previousOff.date.time) <= dwellToleranceMs &&
+        (previousOff.date.time - previousOn.date.time) <= dwellToleranceMs
+}
+
+private Boolean isInsideModeSwitchDwell(Long offMs, Long onMs) {
+    return offMs && onMs && (onMs - offMs) <= (modeSwitchDwellMilliseconds() as Long)
+}
+
+private Long eventTimeMs(evt) {
+    try {
+        return evt?.date?.time ? evt.date.time as Long : now()
+    } catch (Exception ignored) {
+        return now()
     }
 }
 
@@ -339,7 +711,14 @@ private Integer currentDimmerLevel() {
 }
 
 private Boolean isDaylightNow() {
-    Date current = new Date()
+    return isDaylightAt(new Date())
+}
+
+private String desiredMultiToggleModeAt(Date current) {
+    return isDaylightAt(current) ? "day" : "night"
+}
+
+private Boolean isDaylightAt(Date current) {
     Date dayStartTime = resolveBoundary(dayStart ?: "sunrise", current)
     Date nightStartTime = resolveBoundary(nightStart ?: "sunset", current)
 
@@ -409,6 +788,14 @@ private Integer offDelaySecondsValue() {
 
 private Integer multiToggleDwellMilliseconds() {
     return clamp(safeInteger(multiToggleDwellMs, 500), 0, 60000)
+}
+
+private Integer modeSwitchDwellSecondsValue() {
+    return clamp(safeInteger(modeSwitchDwellSeconds, 4), 0, 300)
+}
+
+private Integer modeSwitchDwellMilliseconds() {
+    return modeSwitchDwellSecondsValue() * 1000
 }
 
 private Integer safeInteger(value, Integer fallback) {
