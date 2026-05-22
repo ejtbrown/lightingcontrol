@@ -139,21 +139,18 @@ def updated() {
     log.info "Updated ${configurationTitle()}"
     unsubscribe()
     unschedule()
-    state.offDeadlineMs = null
+    clearOffDeadlineState()
     initialize()
 }
 
 def initialize() {
     atomicState.multiToggleInProgress = false
     atomicState.ignoreSwitchEventsUntilMs = null
-    atomicState.multiToggleCycleActive = false
 
     if (!configurationComplete()) {
         log.warn "App is not fully configured. Select a motion or presence sensor and at least one controlled light."
         return
     }
-
-    ensureMultiToggleTrackerStateVersion()
 
     if (motionDevice) {
         subscribe(motionDevice, "motion", "presenceSourceHandler")
@@ -169,11 +166,12 @@ def initialize() {
 
     if (isPresenceActive()) {
         clearOffDeadline()
-    } else {
+        ensureTargetState("initialize")
+    } else if (anyControlledDeviceOn()) {
         scheduleOffDelay()
+    } else {
+        clearOffDeadline()
     }
-
-    ensureTargetState("initialize")
 }
 
 def presenceSourceHandler(evt) {
@@ -181,8 +179,10 @@ def presenceSourceHandler(evt) {
 
     if (isPresenceActive()) {
         clearOffDeadline()
-    } else {
+    } else if (anyControlledDeviceOn()) {
         scheduleOffDelay()
+    } else {
+        clearOffDeadline()
     }
 
     ensureTargetState("presence event")
@@ -190,15 +190,31 @@ def presenceSourceHandler(evt) {
 
 def controlledSwitchHandler(evt) {
     logDebug "Controlled switch event: ${evt.device} ${evt.value}"
-    recordControlledSwitchEvent(evt)
 
     Long ignoreUntil = safeLong(atomicState.ignoreSwitchEventsUntilMs, null)
-    if (atomicState.multiToggleInProgress || (ignoreUntil && now() < ignoreUntil)) {
+    Long currentMs = now()
+    Boolean commandWindowActive = ignoreUntil && currentMs < ignoreUntil
+    if (!commandWindowActive && atomicState.multiToggleInProgress) {
+        atomicState.multiToggleInProgress = false
+    }
+
+    recordControlledSwitchEvent(evt, commandWindowActive)
+
+    if (commandWindowActive) {
         logDebug "Ignoring controlled switch event during multi-toggle sequence"
         return
     }
 
+    if (isSelectedMultiToggleSwitch(evt.device) && evt.value == "off" && shouldLightsBeOn()) {
+        scheduleManualMultiToggleRecheck(evt.device)
+        return
+    }
+
     ensureTargetState("controlled switch event")
+}
+
+def recheckAfterManualMultiToggle() {
+    ensureTargetState("manual multi-toggle recheck")
 }
 
 def turnOffAfterDelay() {
@@ -209,7 +225,7 @@ def turnOffAfterDelay() {
         return
     }
 
-    Long deadline = state.offDeadlineMs as Long
+    Long deadline = offDeadlineMs()
     if (deadline && now() < deadline) {
         Integer remainingSeconds = Math.max(1, Math.ceil((deadline - now()) / 1000.0) as Integer)
         logDebug "Off delay fired early; rescheduling for ${remainingSeconds} seconds"
@@ -217,7 +233,7 @@ def turnOffAfterDelay() {
         return
     }
 
-    state.offDeadlineMs = null
+    clearOffDeadlineState()
     ensureTargetState("off delay expired")
 }
 
@@ -257,7 +273,6 @@ private void ensureLightsOn(String reason) {
 
 private void ensureLightsOff(String reason) {
     logDebug "Ensuring lights are off for ${reason}"
-    atomicState.multiToggleCycleActive = false
 
     controlledDevices().each { device ->
         if (device.currentValue("switch") != "off") {
@@ -271,137 +286,65 @@ private void ensureLightsOff(String reason) {
 }
 
 private void ensureMultiToggleSwitchOn(device, String desiredMode) {
-    ensureMultiToggleTrackerStateVersion()
-
-    String currentMode = knownMultiToggleMode(device)
     Boolean isOn = device.currentValue("switch") == "on"
 
     if (isOn) {
-        if (!currentMode) {
-            logDebug "Assuming ${device} is already in ${desiredMode} mode because it is on"
-            setKnownMultiToggleMode(device, desiredMode, "assumed")
-            return
-        }
-
-        if (currentMode == desiredMode) {
-            logDebug "${device} is already on in ${desiredMode} mode"
-            return
-        }
-
-        logDebug "Switching ${device} from ${currentMode} to ${desiredMode} mode while on"
-        runMultiToggleFromOn(device, desiredMode)
+        logDebug "${device} is already on; leaving current mode unchanged"
         return
     }
 
-    if (!currentMode) {
-        logDebug "No known mode for ${device}; establishing ${desiredMode} mode"
-        if (desiredMode == "night") {
-            runMultiToggleFromOff(device, desiredMode, currentMode)
-        } else {
-            turnMultiToggleOnPreservingMode(device, desiredMode)
-        }
+    if (desiredMode == "night") {
+        turnMultiToggleOnForNight(device)
         return
     }
 
-    if (currentMode == desiredMode) {
-        turnMultiToggleOnPreservingMode(device, desiredMode)
-        return
-    }
-
-    if (isWithinModeSwitchDwell(device)) {
-        logDebug "Turning on ${device} within mode switch dwell to change ${currentMode} mode to ${desiredMode} mode"
-        turnMultiToggleOnExpectingMode(device, desiredMode)
-        return
-    }
-
-    logDebug "Running multi-toggle sequence for ${device} to change ${currentMode} mode to ${desiredMode} mode"
-    runMultiToggleFromOff(device, desiredMode, currentMode)
+    turnMultiToggleOnForDay(device)
 }
 
-private void turnMultiToggleOnPreservingMode(device, String desiredMode) {
-    Integer waitMs = remainingModeSwitchDwellMs(device)
-    if (waitMs > 0) {
-        Long eventSerial = multiToggleEventSerial(device)
-        logDebug "Waiting ${waitMs}ms before turning on ${device} to preserve ${desiredMode} mode"
-        pauseExecution(waitMs)
+private void turnMultiToggleOnForDay(device) {
+    if (!waitForModeSwitchDwell(device, "turning on ${device} in day mode")) {
+        return
+    }
 
-        if (multiToggleEventSerial(device) != eventSerial) {
-            logDebug "${device} changed while waiting to preserve ${desiredMode} mode; re-evaluating"
-            ensureMultiToggleSwitchOn(device, desiredMode)
-            return
-        }
+    if (!shouldLightsBeOn()) {
+        logDebug "Not turning on ${device}; lights are no longer expected to be on"
+        return
     }
 
     if (device.currentValue("switch") == "on") {
-        String currentMode = knownMultiToggleMode(device)
-        if (currentMode == desiredMode) {
-            logDebug "${device} turned on in ${desiredMode} mode while waiting; no on command needed"
-            return
-        }
-
-        logDebug "${device} turned on in ${currentMode ?: 'unknown'} mode while waiting; switching to ${desiredMode} mode"
-        runMultiToggleFromOn(device, desiredMode)
+        logDebug "${device} turned on while waiting; leaving current mode unchanged"
         return
     }
 
-    logDebug "Turning on ${device} in ${desiredMode} mode"
-    turnMultiToggleOnPreservingKnownMode(device, desiredMode)
-}
-
-private void turnMultiToggleOnPreservingKnownMode(device, String desiredMode) {
-    device.on()
-    setKnownMultiToggleMode(device, desiredMode, "app-preserved")
-}
-
-private void turnMultiToggleOnExpectingMode(device, String expectedMode) {
-    setExpectedMultiToggleMode(device, expectedMode)
-    device.on()
-    setKnownMultiToggleMode(device, expectedMode)
-}
-
-private void runMultiToggleFromOn(device, String desiredMode) {
-    Integer dwellMs = multiToggleDwellMilliseconds()
-
-    beginMultiToggleCommandWindow(dwellMs + 5000)
+    logDebug "Turning on ${device} once for day mode"
+    beginMultiToggleCommandWindow(5000)
     try {
-        logDebug "Starting on-state multi-toggle sequence for ${device}; dwell=${dwellMs}ms; desiredMode=${desiredMode}"
-        recordMultiToggleOff(device, now())
-        device.off()
-        pauseExecution(dwellMs)
-        turnMultiToggleOnExpectingMode(device, desiredMode)
+        device.on()
     } finally {
         endMultiToggleCommandWindow()
     }
 }
 
-private void runMultiToggleFromOff(device, String desiredMode, String currentMode) {
-    Integer dwellMs = multiToggleDwellMilliseconds()
-    Integer waitMs = remainingModeSwitchDwellMs(device)
-    if (waitMs > 0) {
-        Long eventSerial = multiToggleEventSerial(device)
-        logDebug "Waiting ${waitMs}ms before starting multi-toggle sequence for ${device}"
-        pauseExecution(waitMs)
-
-        if (multiToggleEventSerial(device) != eventSerial) {
-            logDebug "${device} changed while waiting to start a multi-toggle sequence; re-evaluating ${desiredMode} mode"
-            ensureMultiToggleSwitchOn(device, desiredMode)
-            return
-        }
-    }
-
-    if (device.currentValue("switch") == "on") {
-        logDebug "${device} turned on while waiting to start a multi-toggle sequence"
-        ensureMultiToggleSwitchOn(device, desiredMode)
+private void turnMultiToggleOnForNight(device) {
+    if (!waitForModeSwitchDwell(device, "starting night on/off/on sequence for ${device}")) {
         return
     }
 
+    if (!shouldLightsBeOn()) {
+        logDebug "Not starting night on/off/on sequence for ${device}; lights are no longer expected to be on"
+        return
+    }
+
+    if (device.currentValue("switch") == "on") {
+        logDebug "${device} turned on while waiting; leaving current mode unchanged"
+        return
+    }
+
+    Integer dwellMs = quickToggleDwellMilliseconds()
     beginMultiToggleCommandWindow((dwellMs * 2) + 5000)
 
     try {
-        logDebug "Starting off-state multi-toggle sequence for ${device}; dwell=${dwellMs}ms; currentMode=${currentMode ?: 'unknown'}; desiredMode=${desiredMode}"
-        if (currentMode) {
-            setExpectedMultiToggleMode(device, currentMode)
-        }
+        logDebug "Starting night on/off/on sequence for ${device}; dwell=${dwellMs}ms"
         device.on()
         pauseExecution(dwellMs)
 
@@ -409,10 +352,33 @@ private void runMultiToggleFromOff(device, String desiredMode, String currentMod
         device.off()
         pauseExecution(dwellMs)
 
-        turnMultiToggleOnExpectingMode(device, desiredMode)
+        if (!shouldLightsBeOn()) {
+            logDebug "Stopping night on/off/on sequence for ${device}; lights are no longer expected to be on"
+            return
+        }
+
+        device.on()
     } finally {
         endMultiToggleCommandWindow()
     }
+}
+
+private Boolean waitForModeSwitchDwell(device, String action) {
+    Integer waitMs = remainingModeSwitchDwellMs(device)
+    if (waitMs <= 0) {
+        return true
+    }
+
+    Long eventSerial = multiToggleEventSerial(device)
+    logDebug "Waiting ${waitMs}ms before ${action}"
+    pauseExecution(waitMs)
+
+    if (multiToggleEventSerial(device) != eventSerial) {
+        logDebug "${device} changed while waiting before ${action}"
+        return false
+    }
+
+    return true
 }
 
 private void beginMultiToggleCommandWindow(Integer durationMs) {
@@ -425,7 +391,7 @@ private void endMultiToggleCommandWindow() {
     atomicState.ignoreSwitchEventsUntilMs = now() + 5000L
 }
 
-private void recordControlledSwitchEvent(evt) {
+private void recordControlledSwitchEvent(evt, Boolean commandWindowActive) {
     if (!evt?.device || !isSelectedMultiToggleSwitch(evt.device)) {
         return
     }
@@ -441,112 +407,21 @@ private void recordControlledSwitchEvent(evt) {
         return
     }
 
-    String expectedMode = expectedMultiToggleMode(evt.device)
-    if (expectedMode) {
-        setKnownMultiToggleMode(evt.device, expectedMode)
-        clearExpectedMultiToggleMode(evt.device)
-        logDebug "Recorded ${evt.device} as ${expectedMode} mode from app command"
+    if (commandWindowActive) {
+        logDebug "Recorded ${evt.device} on event during app command window"
         return
     }
 
-    String currentMode = knownMultiToggleMode(evt.device)
-    if (currentMode && isWithinModeSwitchDwell(evt.device)) {
-        String newMode = oppositeMultiToggleMode(currentMode)
-        setKnownMultiToggleMode(evt.device, newMode, "event")
-        logDebug "Recorded ${evt.device} as ${newMode} mode from on event inside mode switch dwell"
-    }
+    logDebug "Recorded ${evt.device} on event"
 }
 
 private Boolean isSelectedMultiToggleSwitch(device) {
+    if (!device) {
+        return false
+    }
+
     String deviceId = device.id as String
     return selectedMultiToggleSwitches().any { selected -> (selected.id as String) == deviceId }
-}
-
-private String knownMultiToggleMode(device) {
-    ensureMultiToggleTrackerStateVersion()
-
-    String storedMode = atomicState[multiToggleModeKey(device)] as String
-    String storedSource = multiToggleModeSource(device)
-
-    if (storedMode && storedSource && !modeSourceShouldInferFromHistory(storedSource)) {
-        return storedMode
-    }
-
-    String inferredMode = inferMultiToggleModeFromHistory(device)
-
-    if (inferredMode && (!storedMode || !storedSource || modeSourceShouldInferFromHistory(storedSource))) {
-        logDebug "Inferred ${device} as ${inferredMode} mode from switch history"
-        setKnownMultiToggleMode(device, inferredMode, "history")
-        return inferredMode
-    }
-
-    return storedMode
-}
-
-private Boolean modeSourceShouldInferFromHistory(String source) {
-    return !source || source == "assumed" || source == "app-preserved"
-}
-
-private void ensureMultiToggleTrackerStateVersion() {
-    Integer version = safeInteger(atomicState.multiToggleTrackerStateVersion, 0)
-    if (version >= 2) {
-        return
-    }
-
-    selectedMultiToggleSwitches().each { device ->
-        if (atomicState[multiToggleModeKey(device)]) {
-            atomicState[multiToggleModeSourceKey(device)] = "assumed"
-        }
-        clearExpectedMultiToggleMode(device)
-    }
-
-    atomicState.multiToggleTrackerStateVersion = 2
-    logDebug "Reset multi-toggle mode confidence after tracker update"
-}
-
-private void setKnownMultiToggleMode(device, String mode) {
-    setKnownMultiToggleMode(device, mode, "app")
-}
-
-private void setKnownMultiToggleMode(device, String mode, String source) {
-    if (mode) {
-        atomicState[multiToggleModeKey(device)] = mode
-        atomicState[multiToggleModeSourceKey(device)] = source ?: "app"
-    }
-}
-
-private String multiToggleModeSource(device) {
-    return atomicState[multiToggleModeSourceKey(device)] as String
-}
-
-private String expectedMultiToggleMode(device) {
-    return atomicState[multiToggleExpectedModeKey(device)] as String
-}
-
-private void setExpectedMultiToggleMode(device, String mode) {
-    if (mode) {
-        atomicState[multiToggleExpectedModeKey(device)] = mode
-    }
-}
-
-private void clearExpectedMultiToggleMode(device) {
-    atomicState[multiToggleExpectedModeKey(device)] = null
-}
-
-private String oppositeMultiToggleMode(String mode) {
-    return mode == "night" ? "day" : "night"
-}
-
-private String multiToggleModeKey(device) {
-    return "multiToggleMode_${device.id}"
-}
-
-private String multiToggleModeSourceKey(device) {
-    return "multiToggleModeSource_${device.id}"
-}
-
-private String multiToggleExpectedModeKey(device) {
-    return "multiToggleExpectedMode_${device.id}"
 }
 
 private String multiToggleEventSerialKey(device) {
@@ -576,18 +451,14 @@ private Long lastMultiToggleOffMs(device) {
     return values ? values.max() as Long : null
 }
 
-private Boolean isWithinModeSwitchDwell(device) {
-    return remainingModeSwitchDwellMs(device) > 0
-}
-
 private Integer remainingModeSwitchDwellMs(device) {
     Long lastOffMs = lastMultiToggleOffMs(device)
     if (!lastOffMs) {
         return 0
     }
 
-    Long elapsedMs = now() - lastOffMs
-    Long dwellMs = modeSwitchDwellMilliseconds() as Long
+    Long elapsedMs = Math.max(0L, now() - lastOffMs)
+    Long dwellMs = modeResetDwellMilliseconds() as Long
     return elapsedMs < dwellMs ? Math.max(1, (dwellMs - elapsedMs) as Integer) : 0
 }
 
@@ -607,61 +478,12 @@ private Long latestSwitchOffMsFromHistory(device) {
     }
 }
 
-private String inferMultiToggleModeFromHistory(device) {
-    try {
-        List events = switchEventsFromHistory(device, 24L * 60L * 60L * 1000L, 80).sort { event ->
-            event.date.time
-        }
-        String mode = null
-
-        events.eachWithIndex { event, Integer index ->
-            if (event.value != "on") {
-                return
-            }
-
-            if (isFinalOnInMultiTogglePattern(events, index)) {
-                mode = desiredMultiToggleModeAt(event.date)
-                return
-            }
-
-            def previousEvent = index > 0 ? events[index - 1] : null
-            if (mode && previousEvent?.value == "off" && isInsideModeSwitchDwell(previousEvent.date.time, event.date.time)) {
-                mode = oppositeMultiToggleMode(mode)
-            }
-        }
-
-        return mode
-    } catch (Exception e) {
-        logDebug "Unable to infer multi-toggle mode for ${device}: ${e.message}"
-        return null
-    }
-}
-
 private List switchEventsFromHistory(device, Long lookbackMs, Integer maxEvents) {
     Date since = new Date(now() - lookbackMs)
     def events = device.eventsSince(since, [max: maxEvents])
     return (events ?: []).findAll { event ->
         event.name == "switch" && (event.value == "on" || event.value == "off") && event.date
     }
-}
-
-private Boolean isFinalOnInMultiTogglePattern(List events, Integer index) {
-    if (index < 2 || events[index].value != "on") {
-        return false
-    }
-
-    def previousOff = events[index - 1]
-    def previousOn = events[index - 2]
-    Long dwellToleranceMs = (multiToggleDwellMilliseconds() + 2000L) as Long
-
-    return previousOff.value == "off" &&
-        previousOn.value == "on" &&
-        (events[index].date.time - previousOff.date.time) <= dwellToleranceMs &&
-        (previousOff.date.time - previousOn.date.time) <= dwellToleranceMs
-}
-
-private Boolean isInsideModeSwitchDwell(Long offMs, Long onMs) {
-    return offMs && onMs && (onMs - offMs) <= (modeSwitchDwellMilliseconds() as Long)
 }
 
 private Long eventTimeMs(evt) {
@@ -677,7 +499,7 @@ private Boolean shouldLightsBeOn() {
         return true
     }
 
-    Long deadline = state.offDeadlineMs as Long
+    Long deadline = offDeadlineMs()
     return deadline && now() < deadline
 }
 
@@ -687,10 +509,22 @@ private Boolean isPresenceActive() {
     return motionActive || presencePresent
 }
 
+private Boolean anyControlledDeviceOn() {
+    return controlledDevices().any { device ->
+        device.currentValue("switch") == "on"
+    }
+}
+
+private void scheduleManualMultiToggleRecheck(device) {
+    Integer waitSeconds = Math.max(1, Math.ceil(modeResetDwellMilliseconds() / 1000.0) as Integer)
+    logDebug "Delaying correction for ${device} for ${waitSeconds}s to allow a manual multi-toggle"
+    runIn(waitSeconds, "recheckAfterManualMultiToggle", [overwrite: true])
+}
+
 private void scheduleOffDelay() {
     Integer delaySeconds = offDelaySecondsValue()
     Long deadline = now() + (delaySeconds * 1000L)
-    state.offDeadlineMs = deadline
+    atomicState.offDeadlineMs = deadline
 
     if (delaySeconds <= 0) {
         turnOffAfterDelay()
@@ -701,8 +535,27 @@ private void scheduleOffDelay() {
 }
 
 private void clearOffDeadline() {
-    state.offDeadlineMs = null
+    clearOffDeadlineState()
     unschedule("turnOffAfterDelay")
+}
+
+private void clearOffDeadlineState() {
+    atomicState.offDeadlineMs = null
+    state.offDeadlineMs = null
+}
+
+private Long offDeadlineMs() {
+    Long deadline = safeLong(atomicState.offDeadlineMs, null)
+    if (deadline != null) {
+        return deadline
+    }
+
+    deadline = safeLong(state.offDeadlineMs, null)
+    if (deadline != null) {
+        atomicState.offDeadlineMs = deadline
+    }
+
+    return deadline
 }
 
 private Integer currentDimmerLevel() {
@@ -712,10 +565,6 @@ private Integer currentDimmerLevel() {
 
 private Boolean isDaylightNow() {
     return isDaylightAt(new Date())
-}
-
-private String desiredMultiToggleModeAt(Date current) {
-    return isDaylightAt(current) ? "day" : "night"
 }
 
 private Boolean isDaylightAt(Date current) {
@@ -790,12 +639,27 @@ private Integer multiToggleDwellMilliseconds() {
     return clamp(safeInteger(multiToggleDwellMs, 500), 0, 60000)
 }
 
+private Integer quickToggleDwellMilliseconds() {
+    Integer dwellMs = multiToggleDwellMilliseconds()
+    Integer modeDwellMs = modeSwitchDwellMilliseconds()
+    if (modeDwellMs <= 0) {
+        return dwellMs
+    }
+
+    return Math.min(dwellMs, Math.max(0, modeDwellMs - 100))
+}
+
 private Integer modeSwitchDwellSecondsValue() {
     return clamp(safeInteger(modeSwitchDwellSeconds, 4), 0, 300)
 }
 
 private Integer modeSwitchDwellMilliseconds() {
     return modeSwitchDwellSecondsValue() * 1000
+}
+
+private Integer modeResetDwellMilliseconds() {
+    Integer dwellMs = modeSwitchDwellMilliseconds()
+    return dwellMs > 0 ? dwellMs + 250 : 0
 }
 
 private Integer safeInteger(value, Integer fallback) {

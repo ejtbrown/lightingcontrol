@@ -17,13 +17,13 @@ presence sources.
   on.
 - Single-toggle switches are turned on and off directly, with no dwell delay or
   special sequence.
-- Multi-toggle switches track their inferred day/night mode. The app uses the
-  configured mode switch dwell time and recent switch-off history before
-  turning them on, so a room re-entry just after shutoff does not accidentally
-  flip the fixture into the wrong mode. When a mode change is needed, the app
-  uses the configured multi-toggle dwell delay between on/off commands. Delayed
-  mode-preserving commands are re-evaluated if the switch changes while the app
-  is waiting.
+- Multi-toggle switches are driven directly from the current day/night
+  boundary: daytime uses a single on command, and nighttime uses an on/off/on
+  command sequence. If the switch was just turned off, the app waits through
+  the configured mode-switch dwell before starting either sequence so a recent
+  off event cannot accidentally carry over the previous mode. When a
+  multi-toggle switch is already on, the app leaves its current mode unchanged
+  so physical switch toggles can be used for manual mode changes.
 - Lights remain on while motion or presence is active. When motion or presence
   is absent, the app leaves them on for the configured off delay, then turns
   them off.
